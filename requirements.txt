@@ -4,5 +4,5 @@ numpy
 plotly
 mp-api
 pymatgen
-openai
+google-genai
 pydantic
