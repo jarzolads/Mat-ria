@@ -22,9 +22,14 @@ st.set_page_config(
 )
 
 
-modo = st.sidebar.radio("Modo de trabajo", ["Explorar óxidos", "Búsqueda inversa"])
-if modo == "Búsqueda inversa":
+modo = st.sidebar.radio(
+    "Modo de trabajo",
+    ["Diseño inverso (demo)", "Explorar óxidos"],
+)
+
+if modo == "Diseño inverso (demo)":
     from interfaz_inversa import mostrar_inverso
+
     mostrar_inverso()
     st.stop()
 
