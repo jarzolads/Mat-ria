@@ -1,18 +1,16 @@
 import copy
 import json
+import time
 from datetime import datetime, timezone
 
+import numpy as np
+import pandas as pd
 import plotly.express as px
 import streamlit as st
 
-from agente import conversar
-from ciencia import (
-    CRITERIOS_INICIALES,
-    SISTEMAS,
-    analizar_materiales,
-    descargar_materiales,
-    registros_json,
-)
+from google import genai
+from google.genai import types
+from mp_api.client import MPRester
 
 
 st.set_page_config(
@@ -22,559 +20,942 @@ st.set_page_config(
 )
 
 
-modo = st.sidebar.radio(
-    "Modo de trabajo",
-    ["Diseño inverso (demo)", "Explorar óxidos"],
+# ============================================================
+# CONFIGURACIÓN INICIAL
+# ============================================================
+
+MODELO_GEMINI = "gemini-flash-latest"
+
+EJEMPLO = (
+    "Busca óxidos de hierro con magnetización calculada "
+    "por volumen mínima de 0.02 μB/Å³ y energía sobre la "
+    "envolvente máxima de 0.05 eV/átomo."
 )
 
-if modo == "Diseño inverso (demo)":
-    from interfaz_inversa import mostrar_inverso
 
-    mostrar_inverso()
-    st.stop()
-
-
-def secreto(nombre, predeterminado=""):
-    """Lee los secretos configurados en Streamlit."""
-
+def secreto(nombre, valor_default=""):
     try:
-        return st.secrets.get(
-            nombre,
-            predeterminado,
-        )
+        return st.secrets.get(nombre, valor_default)
     except FileNotFoundError:
-        return predeterminado
+        return valor_default
 
 
-def fecha_actual():
-    return datetime.now(
-        timezone.utc
-    ).isoformat()
+def fecha_utc():
+    return datetime.now(timezone.utc).isoformat()
 
 
-def mensaje_error(error, *claves):
-    """Evita mostrar las claves si aparecen en una excepción."""
+# ============================================================
+# DEFINICIONES EDUCATIVAS
+# ============================================================
 
-    texto = str(error)
+DEFINICIONES = {
+    "Magnetización por volumen": {
+        "definicion": (
+            "Es el momento magnético calculado por unidad de volumen "
+            "del cristal."
+        ),
+        "importancia": (
+            "Permite identificar materiales con comportamiento magnético "
+            "calculado potencialmente interesante."
+        ),
+        "limitacion": (
+            "No equivale al SAR y no predice directamente cuánto "
+            "calentará una nanopartícula."
+        ),
+        "unidad": "μB/Å³",
+    },
+    "Energía sobre la envolvente": {
+        "definicion": (
+            "Es la distancia energética entre el material y la combinación "
+            "de fases más estable calculada para su composición."
+        ),
+        "importancia": (
+            "Un valor menor indica mayor estabilidad termodinámica calculada "
+            "respecto a las fases de referencia."
+        ),
+        "limitacion": (
+            "No garantiza que el material pueda sintetizarse fácilmente "
+            "ni que sea estable bajo cualquier condición experimental."
+        ),
+        "unidad": "eV/átomo",
+    },
+    "Ordenamiento magnético": {
+        "definicion": (
+            "Describe la configuración calculada de los momentos magnéticos, "
+            "por ejemplo ferromagnética o antiferromagnética."
+        ),
+        "importancia": (
+            "Ayuda a describir el comportamiento magnético calculado "
+            "del material."
+        ),
+        "limitacion": (
+            "El resultado corresponde al cálculo del cristal y no demuestra "
+            "el comportamiento de una nanopartícula real."
+        ),
+        "unidad": "clasificación",
+    },
+    "Densidad": {
+        "definicion": (
+            "Es la masa del material por unidad de volumen."
+        ),
+        "importancia": (
+            "Ayuda a comparar materiales y estimar cantidades requeridas."
+        ),
+        "limitacion": (
+            "No es una medida directa del desempeño en hipertermia."
+        ),
+        "unidad": "g/cm³",
+    },
+}
 
-    for clave in claves:
-        if clave:
-            texto = texto.replace(
-                str(clave),
-                "[CLAVE OCULTA]",
-            )
 
-    return f"{type(error).__name__}: {texto}"
+# ============================================================
+# RECETA Y COSTOS EDUCATIVOS
+# ============================================================
+
+RECETA_FE3O4 = {
+    "nombre": "Coprecipitación de magnetita como ejemplo didáctico",
+    "evidencia": (
+        "Plantilla educativa. Debe sustituirse por una receta bibliográfica "
+        "verificada antes de realizar una síntesis."
+    ),
+    "pasos": [
+        "Seleccionar precursores de hierro(II) y hierro(III).",
+        "Preparar una disolución con concentración conocida.",
+        "Agregar una base bajo agitación y pH controlado.",
+        "Separar y lavar el precipitado.",
+        "Secar el material obtenido.",
+        "Caracterizar fase, tamaño, morfología y propiedades magnéticas.",
+    ],
+}
+
+COSTOS_EJEMPLO = pd.DataFrame([
+    {
+        "Material": "Precursor de Fe(III)",
+        "Cantidad_g": 0.80,
+        "Precio_paquete_MXN": 850.00,
+        "Paquete_g": 500.00,
+    },
+    {
+        "Material": "Precursor de Fe(II)",
+        "Cantidad_g": 0.40,
+        "Precio_paquete_MXN": 1200.00,
+        "Paquete_g": 500.00,
+    },
+    {
+        "Material": "Base",
+        "Cantidad_g": 0.60,
+        "Precio_paquete_MXN": 300.00,
+        "Paquete_g": 1000.00,
+    },
+    {
+        "Material": "Agua desionizada",
+        "Cantidad_g": 20.00,
+        "Precio_paquete_MXN": 80.00,
+        "Paquete_g": 1000.00,
+    },
+])
 
 
-# Inicializar el estado de la sesión.
-if "criterios" not in st.session_state:
-    st.session_state.criterios = copy.deepcopy(
-        CRITERIOS_INICIALES
+def calcular_costos(factor_escala=1.0):
+    tabla = COSTOS_EJEMPLO.copy()
+
+    tabla["Cantidad_escala_g"] = (
+        tabla["Cantidad_g"] * factor_escala
     )
 
-if "mensajes" not in st.session_state:
-    st.session_state.mensajes = []
+    tabla["Costo_MXN"] = (
+        tabla["Cantidad_escala_g"]
+        * tabla["Precio_paquete_MXN"]
+        / tabla["Paquete_g"]
+    )
 
-if "registros" not in st.session_state:
-    st.session_state.registros = []
+    costo_precursores = tabla["Costo_MXN"].sum()
 
-if "revision_formulario" not in st.session_state:
-    st.session_state.revision_formulario = 0
+    energia = 25.00
+    consumibles = 50.00
+
+    total = costo_precursores + energia + consumibles
+
+    resumen = {
+        "Precursores": costo_precursores,
+        "Energía": energia,
+        "Consumibles": consumibles,
+        "Total": total,
+    }
+
+    return tabla, resumen
+
+
+# ============================================================
+# MATERIALS PROJECT
+# ============================================================
+
+
+def descargar_materiales():
+    api_key = secreto("MP_API_KEY")
+
+    if not api_key:
+        raise ValueError(
+            "No existe MP_API_KEY en los secretos de Streamlit."
+        )
+
+    campos = [
+        "material_id",
+        "formula_pretty",
+        "chemsys",
+        "density",
+        "energy_above_hull",
+        "ordering",
+        "total_magnetization_normalized_vol",
+        "symmetry",
+    ]
+
+    with MPRester(
+        api_key,
+        use_document_model=False,
+    ) as mpr:
+
+        documentos = mpr.materials.summary.search(
+            chemsys=["Fe-O"],
+            deprecated=False,
+            fields=campos,
+        )
+
+    filas = []
+
+    for documento in documentos:
+
+        ordenamiento = documento.get("ordering")
+
+        if hasattr(ordenamiento, "value"):
+            ordenamiento = ordenamiento.value
+
+        simetria = documento.get("symmetry") or {}
+
+        filas.append({
+            "material_id": str(
+                documento.get("material_id")
+            ),
+            "formula": documento.get(
+                "formula_pretty"
+            ),
+            "sistema": documento.get(
+                "chemsys"
+            ),
+            "densidad": documento.get(
+                "density"
+            ),
+            "E_hull": documento.get(
+                "energy_above_hull"
+            ),
+            "M_vol": documento.get(
+                "total_magnetization_normalized_vol"
+            ),
+            "ordenamiento": ordenamiento,
+            "grupo_espacial": simetria.get(
+                "symbol"
+            ),
+        })
+
+    datos = pd.DataFrame(filas)
+
+    for columna in [
+        "densidad",
+        "E_hull",
+        "M_vol",
+    ]:
+        datos[columna] = pd.to_numeric(
+            datos[columna],
+            errors="coerce",
+        )
+
+    return datos
+
+
+# ============================================================
+# BÚSQUEDA INVERSA
+# ============================================================
+
+
+def buscar_candidatos(
+    datos,
+    magnetizacion_minima=0.02,
+    hull_maximo=0.05,
+    densidad_maxima=None,
+):
+    resultado = datos.copy()
+
+    razones = []
+    estados = []
+    distancias = []
+
+    for _, fila in resultado.iterrows():
+
+        motivos = []
+        distancia = 0.0
+
+        magnetizacion = fila["M_vol"]
+        energia = fila["E_hull"]
+        densidad = fila["densidad"]
+
+        if pd.isna(magnetizacion):
+            motivos.append(
+                "No hay magnetización calculada"
+            )
+            estados.append("Sin datos suficientes")
+            razones.append("; ".join(motivos))
+            distancias.append(np.nan)
+            continue
+
+        if pd.isna(energia):
+            motivos.append(
+                "No hay energía sobre la envolvente"
+            )
+            estados.append("Sin datos suficientes")
+            razones.append("; ".join(motivos))
+            distancias.append(np.nan)
+            continue
+
+        if energia > hull_maximo:
+            motivos.append(
+                "Supera E_hull máximo"
+            )
+
+        if magnetizacion < magnetizacion_minima:
+            motivos.append(
+                "Magnetización inferior al objetivo"
+            )
+            distancia += (
+                magnetizacion_minima - magnetizacion
+            ) / magnetizacion_minima
+
+        if (
+            densidad_maxima is not None
+            and not pd.isna(densidad)
+            and densidad > densidad_maxima
+        ):
+            motivos.append(
+                "Densidad superior al objetivo"
+            )
+            distancia += (
+                densidad - densidad_maxima
+            ) / densidad_maxima
+
+        if energia <= hull_maximo and not motivos:
+            estado = "Cumple objetivos"
+        elif energia > hull_maximo:
+            estado = "Excluido"
+        else:
+            estado = "Aproximado"
+
+        estados.append(estado)
+        razones.append("; ".join(motivos))
+        distancias.append(distancia)
+
+    resultado["estado"] = estados
+    resultado["motivos"] = razones
+    resultado["distancia"] = distancias
+
+    orden = {
+        "Cumple objetivos": 0,
+        "Aproximado": 1,
+        "Sin datos suficientes": 2,
+        "Excluido": 3,
+    }
+
+    resultado["_orden"] = resultado["estado"].map(orden)
+
+    resultado = resultado.sort_values(
+        ["_orden", "distancia"],
+        na_position="last",
+    )
+
+    return resultado.drop(
+        columns="_orden"
+    ).reset_index(drop=True)
+
+
+# ============================================================
+# AGENTE GEMINI
+# ============================================================
+
+
+DECLARACION_BUSQUEDA = types.FunctionDeclaration(
+    name="buscar_materiales",
+    description=(
+        "Busca materiales de Fe-O que cumplan objetivos "
+        "de magnetización, estabilidad y opcionalmente densidad."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "magnetizacion_minima": {
+                "type": "number",
+                "description": (
+                    "Magnetización mínima en μB/Å³."
+                ),
+            },
+            "hull_maximo": {
+                "type": "number",
+                "description": (
+                    "Energía sobre la envolvente máxima "
+                    "en eV/átomo."
+                ),
+            },
+            "densidad_maxima": {
+                "type": [
+                    "number",
+                    "null",
+                ],
+                "description": (
+                    "Densidad máxima en g/cm³, "
+                    "o null si no se solicita."
+                ),
+            },
+        },
+        "required": [
+            "magnetizacion_minima",
+            "hull_maximo",
+            "densidad_maxima",
+        ],
+    },
+)
+
+
+INSTRUCCIONES_GEMINI = """
+Eres Matéria, un agente educativo de diseño inverso de materiales.
+
+El usuario expresa propiedades deseadas. Tú debes convertir su solicitud
+en argumentos para la herramienta buscar_materiales.
+
+Reglas:
+
+- Trabaja únicamente con registros Fe-O que ya fueron descargados.
+- No inventes materiales ni propiedades.
+- Si el usuario pide más magnetización, aumenta magnetizacion_minima.
+- Si pide mayor estabilidad o menor energía, reduce hull_maximo.
+- Si pide baja densidad, utiliza densidad_maxima.
+- Si el usuario no solicita densidad, utiliza null.
+- Las unidades son μB/Å³, eV/átomo y g/cm³.
+- No afirmes que el material tendrá alto SAR.
+- No afirmes que una propiedad calculada demuestra biocompatibilidad.
+- Explica en español qué pidió el usuario y cuántos candidatos cumplen.
+- Menciona como máximo tres material_id.
+- No describas todos los registros de la tabla.
+"""
+
+
+def ejecutar_agente(
+    pregunta,
+    datos,
+):
+    api_key = secreto("GEMINI_API_KEY")
+
+    if not api_key:
+        raise ValueError(
+            "No existe GEMINI_API_KEY en los secretos."
+        )
+
+    cliente = genai.Client(
+        api_key=api_key
+    )
+
+    configuracion = types.GenerateContentConfig(
+        system_instruction=INSTRUCCIONES_GEMINI,
+        tools=[
+            types.Tool(
+                function_declarations=[
+                    DECLARACION_BUSQUEDA
+                ]
+            )
+        ],
+        automatic_function_calling=(
+            types.AutomaticFunctionCallingConfig(
+                disable=True
+            )
+        ),
+    )
+
+    respuesta = cliente.models.generate_content(
+        model=secreto(
+            "GEMINI_MODEL",
+            MODELO_GEMINI,
+        ),
+        contents=pregunta,
+        config=configuracion,
+    )
+
+    llamadas = []
+
+    if respuesta.candidates:
+        contenido = respuesta.candidates[0].content
+
+        if contenido and contenido.parts:
+            llamadas = [
+                parte.function_call
+                for parte in contenido.parts
+                if parte.function_call is not None
+            ]
+
+    if not llamadas:
+        return (
+            respuesta.text
+            or "Gemini no produjo una solicitud estructurada.",
+            None,
+            None,
+        )
+
+    llamada = llamadas[0]
+    argumentos = dict(llamada.args)
+
+    resultado = buscar_candidatos(
+        datos,
+        magnetizacion_minima=float(
+            argumentos["magnetizacion_minima"]
+        ),
+        hull_maximo=float(
+            argumentos["hull_maximo"]
+        ),
+        densidad_maxima=(
+            None
+            if argumentos["densidad_maxima"] is None
+            else float(
+                argumentos["densidad_maxima"]
+            )
+        ),
+    )
+
+    resumen = {
+        "total_materiales": len(resultado),
+        "cumplen": int(
+            (
+                resultado["estado"]
+                == "Cumple objetivos"
+            ).sum()
+        ),
+        "aproximados": int(
+            (
+                resultado["estado"]
+                == "Aproximado"
+            ).sum()
+        ),
+        "candidatos": json.loads(
+            resultado.head(5).to_json(
+                orient="records",
+                double_precision=8,
+            )
+        ),
+    }
+
+    respuesta_funcion = types.Part(
+        function_response=types.FunctionResponse(
+            name="buscar_materiales",
+            response=resumen,
+        )
+    )
+
+    respuesta_final = cliente.models.generate_content(
+        model=secreto(
+            "GEMINI_MODEL",
+            MODELO_GEMINI,
+        ),
+        contents=[
+            types.Content(
+                role="user",
+                parts=[
+                    types.Part.from_text(
+                        text=pregunta
+                    )
+                ],
+            ),
+            respuesta.candidates[0].content,
+            types.Content(
+                role="user",
+                parts=[respuesta_funcion],
+            ),
+        ],
+        config=types.GenerateContentConfig(
+            system_instruction=INSTRUCCIONES_GEMINI,
+        ),
+    )
+
+    return (
+        respuesta_final.text
+        or "La búsqueda fue ejecutada.",
+        argumentos,
+        resultado,
+    )
+
+
+# ============================================================
+# ESTADO DE STREAMLIT
+# ============================================================
+
+
+if "datos" not in st.session_state:
+    st.session_state.datos = None
+
+if "resultado" not in st.session_state:
+    st.session_state.resultado = None
+
+if "historial" not in st.session_state:
+    st.session_state.historial = []
+
+
+# ============================================================
+# INTERFAZ
+# ============================================================
 
 
 st.title("🔬 Matéria")
 
-st.caption(
-    "Agente con Gemini para el cribado multicriterio de óxidos."
+st.subheader(
+    "Demostración de diseño inverso de materiales"
 )
 
 st.write(
-    "Explora el compromiso entre baja densidad y alto módulo "
-    "de corte, sujeto a un límite de energía sobre la "
-    "envolvente convexa."
+    "En lugar de preguntar qué propiedades tiene un material, "
+    "comenzamos indicando qué propiedades deseamos."
+)
+
+st.info(
+    "Ejemplo: «Busca óxidos de hierro con magnetización "
+    "mínima de 0.02 μB/Å³ y E_hull máximo de 0.05 eV/átomo»."
 )
 
 
-# ---------------------------------------------------------
-# PANEL LATERAL
-# ---------------------------------------------------------
-with st.sidebar:
-    st.header("1. Cargar datos")
+col1, col2 = st.columns(2)
 
-    st.caption(
-        "Sistemas disponibles: Al–O, Mg–O y Al–Mg–O."
-    )
+if col1.button(
+    "Cargar datos de Materials Project",
+    use_container_width=True,
+):
 
-    cargar = st.button(
-        "Consultar Materials Project",
-        use_container_width=True,
-    )
+    try:
 
-    if cargar:
-        clave_mp = secreto("MP_API_KEY")
-
-        if not clave_mp:
-            st.error(
-                "Falta configurar MP_API_KEY "
-                "en los secretos de Streamlit."
-            )
-        else:
-            try:
-                with st.spinner(
-                    "Descargando y procesando materiales..."
-                ):
-                    datos, metadata = descargar_materiales(
-                        clave_mp
-                    )
-
-                    resultado = analizar_materiales(
-                        datos,
-                        st.session_state.criterios,
-                    )
-
-                st.session_state.datos = datos
-                st.session_state.metadata = metadata
-                st.session_state.resultado = resultado
-
-                # Una nueva descarga inicia un expediente nuevo.
-                st.session_state.mensajes = []
-                st.session_state.registros = [{
-                    "origen": "carga_datos",
-                    "fecha_utc": fecha_actual(),
-                    "criterios": copy.deepcopy(
-                        st.session_state.criterios
-                    ),
-                    "sha256_tabla": metadata["sha256_tabla"],
-                }]
-
-                st.success(
-                    f"Se descargaron {len(datos)} registros."
-                )
-
-            except Exception as error:
-                st.error(
-                    "No se pudo completar la consulta."
-                )
-                st.code(
-                    mensaje_error(
-                        error,
-                        clave_mp,
-                    ),
-                    language="text",
-                )
-
-    st.divider()
-    st.header("2. Definir criterios")
-
-    criterios = st.session_state.criterios
-    revision = st.session_state.revision_formulario
-
-    # La revisión permite actualizar los controles
-    # cuando el chat cambia los criterios.
-    with st.form(
-        key=f"filtros_{revision}"
-    ):
-        sistemas = st.multiselect(
-            "Sistemas químicos",
-            options=SISTEMAS,
-            default=criterios["sistemas"],
-            key=f"sistemas_{revision}",
-        )
-
-        densidad = st.number_input(
-            "Densidad máxima (g/cm³)",
-            min_value=0.0,
-            value=float(
-                criterios["densidad_max"]
-            ),
-            step=0.1,
-            format="%.4f",
-            key=f"densidad_{revision}",
-        )
-
-        corte = st.number_input(
-            "Módulo de corte mínimo (GPa)",
-            min_value=0.0,
-            value=float(
-                criterios["corte_min"]
-            ),
-            step=10.0,
-            format="%.4f",
-            key=f"corte_{revision}",
-        )
-
-        hull = st.number_input(
-            "Energía sobre la envolvente máxima (eV/átomo)",
-            min_value=0.0,
-            value=float(
-                criterios["hull_max"]
-            ),
-            step=0.01,
-            format="%.4f",
-            key=f"hull_{revision}",
-        )
-
-        aplicar = st.form_submit_button(
-            "Aplicar filtros",
-            use_container_width=True,
-        )
-
-    if aplicar:
-        if not sistemas:
-            st.error(
-                "Selecciona al menos un sistema."
+        with st.spinner(
+            "Descargando registros Fe-O..."
+        ):
+            st.session_state.datos = (
+                descargar_materiales()
             )
 
-        elif densidad <= 0:
-            st.error(
-                "La densidad máxima debe ser mayor que cero."
-            )
-
-        elif "datos" not in st.session_state:
-            st.error(
-                "Primero consulta Materials Project."
-            )
-
-        else:
-            nuevos_criterios = {
-                "sistemas": sistemas,
-                "densidad_max": densidad,
-                "corte_min": corte,
-                "hull_max": hull,
-            }
-
-            st.session_state.resultado = analizar_materiales(
-                st.session_state.datos,
-                nuevos_criterios,
-            )
-
-            st.session_state.criterios = nuevos_criterios
-
-            st.session_state.registros.append({
-                "origen": "formulario",
-                "fecha_utc": fecha_actual(),
-                "criterios": copy.deepcopy(
-                    nuevos_criterios
-                ),
-            })
-
-    st.caption(
-        "Los cambios del formulario se aplican "
-        "al pulsar «Aplicar filtros»."
-    )
-
-
-# ---------------------------------------------------------
-# PANTALLA INICIAL
-# ---------------------------------------------------------
-if "datos" not in st.session_state:
-    st.info(
-        "Para comenzar, pulsa «Consultar Materials Project» "
-        "en el panel lateral."
-    )
-
-    st.write(
-        "Después podrás utilizar los filtros o conversar "
-        "con Gemini para modificar los criterios."
-    )
-
-    st.stop()
-
-
-# ---------------------------------------------------------
-# CRITERIOS Y RESULTADOS
-# ---------------------------------------------------------
-st.subheader("Criterios aplicados")
-
-st.json(
-    st.session_state.criterios
-)
-
-st.caption(
-    "Los valores iniciales son ilustrativos. "
-    "El límite de 0.05 eV/átomo no es un umbral universal "
-    "de estabilidad o sintetizabilidad."
-)
-
-resultado = st.session_state.resultado
-
-aceptados = resultado.loc[
-    resultado["aceptado"]
-].copy()
-
-frente = aceptados.loc[
-    aceptados["pareto"]
-]
-
-col1, col2, col3 = st.columns(3)
-
-col1.metric(
-    "Registros descargados",
-    len(resultado),
-)
-
-col2.metric(
-    "Cumplen los criterios",
-    len(aceptados),
-)
-
-col3.metric(
-    "En el frente de Pareto",
-    len(frente),
-)
-
-
-# ---------------------------------------------------------
-# GRÁFICA DE PARETO
-# ---------------------------------------------------------
-st.subheader("Densidad y rigidez")
-
-if aceptados.empty:
-    st.warning(
-        "Ningún material cumple los criterios actuales. "
-        "Revisa los motivos de descarte antes de modificar "
-        "las restricciones."
-    )
-
-else:
-    datos_grafica = aceptados.copy()
-
-    datos_grafica["Clasificación"] = (
-        datos_grafica["pareto"].map({
-            True: "Frente de Pareto",
-            False: "Dominado",
-        })
-    )
-
-    figura = px.scatter(
-        datos_grafica,
-        x="densidad",
-        y="G_VRH",
-        color="Clasificación",
-        hover_name="formula",
-        hover_data=[
-            "material_id",
-            "E_hull",
-            "K_VRH",
-        ],
-        labels={
-            "densidad": "Densidad (g/cm³)",
-            "G_VRH": "Módulo de corte VRH (GPa)",
-        },
-        color_discrete_map={
-            "Frente de Pareto": "#00897B",
-            "Dominado": "#B0BEC5",
-        },
-    )
-
-    figura.update_traces(
-        marker={"size": 12}
-    )
-
-    st.plotly_chart(
-        figura,
-        use_container_width=True,
-    )
-
-    st.caption(
-        "Menor densidad hacia la izquierda y mayor rigidez "
-        "hacia arriba. El frente se calcula únicamente entre "
-        "los candidatos aceptados de esta copia de datos."
-    )
-
-
-# ---------------------------------------------------------
-# TABLAS
-# ---------------------------------------------------------
-tab1, tab2 = st.tabs([
-    "Candidatos",
-    "Todos los registros y descartes",
-])
-
-with tab1:
-    st.dataframe(
-        aceptados.sort_values(
-            ["pareto", "densidad"],
-            ascending=[False, True],
-        ),
-        hide_index=True,
-        use_container_width=True,
-    )
-
-with tab2:
-    st.dataframe(
-        resultado,
-        hide_index=True,
-        use_container_width=True,
-    )
-
-st.caption(
-    "Unidades: densidad en g/cm³; G_VRH y K_VRH en GPa; "
-    "E_hull en eV/átomo. Los datos faltantes no se sustituyen "
-    "por valores generados por el modelo."
-)
-
-
-# ---------------------------------------------------------
-# DESCARGAS
-# ---------------------------------------------------------
-st.subheader("Guardar el análisis")
-
-st.download_button(
-    "Descargar tabla completa CSV",
-    data=resultado.to_csv(
-        index=False
-    ).encode("utf-8-sig"),
-    file_name="materia_resultados.csv",
-    mime="text/csv",
-)
-
-expediente = {
-    "metadata": st.session_state.metadata,
-    "criterios": st.session_state.criterios,
-    "datos_descargados": registros_json(
-        st.session_state.datos
-    ),
-    "resultados": registros_json(
-        resultado
-    ),
-    "conversacion": st.session_state.mensajes,
-    "registros": st.session_state.registros,
-}
-
-st.download_button(
-    "Descargar expediente JSON",
-    data=json.dumps(
-        expediente,
-        ensure_ascii=False,
-        indent=2,
-        allow_nan=False,
-    ),
-    file_name="materia_expediente.json",
-    mime="application/json",
-)
-
-st.caption(
-    "La información se mantiene durante esta sesión. "
-    "Descarga el expediente para conservarla. "
-    "Esta versión todavía no incluye la recarga del JSON."
-)
-
-
-# ---------------------------------------------------------
-# CHAT CON GEMINI
-# ---------------------------------------------------------
-st.divider()
-
-st.subheader("Conversar con Matéria")
-
-st.caption(
-    "Ejemplo: «Busca óxidos con aluminio, densidad máxima "
-    "de 4 g/cm³ y módulo de corte mínimo de 80 GPa»."
-)
-
-for mensaje in st.session_state.mensajes:
-    with st.chat_message(
-        mensaje["role"]
-    ):
-        st.markdown(
-            mensaje["content"]
+        st.success(
+            f"Se descargaron "
+            f"{len(st.session_state.datos)} registros."
         )
 
-pregunta = st.chat_input(
-    "Escribe tu solicitud"
-)
-
-if pregunta:
-    clave_gemini = secreto(
-        "GEMINI_API_KEY"
-    )
-
-    modelo = secreto(
-        "GEMINI_MODEL",
-        "gemini-flash-latest",
-    )
-
-    if not clave_gemini:
+    except Exception as error:
         st.error(
-            "Falta configurar GEMINI_API_KEY. "
-            "Los filtros manuales siguen disponibles."
+            f"No se pudieron descargar los datos: "
+            f"{type(error).__name__}: {error}"
+        )
+
+
+if col2.button(
+    "Probar diseño inverso",
+    use_container_width=True,
+):
+
+    if st.session_state.datos is None:
+
+        st.warning(
+            "Primero carga los datos de Materials Project."
         )
 
     else:
+
         try:
+
             with st.spinner(
-                "Gemini está analizando tu solicitud..."
+                "Gemini interpreta la solicitud..."
             ):
-                (
-                    texto,
-                    nuevos_criterios,
-                    nuevo_resultado,
-                    registro,
-                ) = conversar(
-                    mensaje=pregunta,
-                    historial=st.session_state.mensajes,
-                    datos=st.session_state.datos,
-                    criterios=st.session_state.criterios,
-                    api_key=clave_gemini,
-                    modelo=modelo,
+
+                texto, criterios, resultado = (
+                    ejecutar_agente(
+                        EJEMPLO,
+                        st.session_state.datos,
+                    )
                 )
 
-            registro["fecha_utc"] = fecha_actual()
-
-            st.session_state.mensajes.extend([
+            st.session_state.historial.append(
                 {
-                    "role": "user",
-                    "content": pregunta,
-                },
-                {
-                    "role": "assistant",
-                    "content": texto,
-                },
-            ])
-
-            st.session_state.criterios = nuevos_criterios
-
-            st.session_state.registros.append(
-                registro
+                    "usuario": EJEMPLO,
+                    "agente": texto,
+                }
             )
 
-            if nuevo_resultado is not None:
-                st.session_state.resultado = nuevo_resultado
-
-                st.session_state.revision_formulario += 1
-
-            st.rerun()
+            st.session_state.resultado = resultado
 
         except Exception as error:
             st.error(
-                "No se completó la conversación con Gemini. "
-                "Comprueba la clave, el modelo y la cuota disponible."
-            )
-
-            st.code(
-                mensaje_error(
-                    error,
-                    clave_gemini,
-                ),
-                language="text",
+                f"No se pudo ejecutar el agente: "
+                f"{type(error).__name__}: {error}"
             )
 
 
-# ---------------------------------------------------------
-# TRAZABILIDAD
-# ---------------------------------------------------------
-with st.expander(
-    "Registro de ejecución"
-):
-    st.json(
-        st.session_state.registros
+st.divider()
+
+pregunta = st.chat_input(
+    "Escribe las propiedades que deseas"
+)
+
+if pregunta:
+
+    if st.session_state.datos is None:
+
+        st.warning(
+            "Primero carga los datos de Materials Project."
+        )
+
+    else:
+
+        try:
+
+            with st.spinner(
+                "Gemini está interpretando tu solicitud..."
+            ):
+
+                texto, criterios, resultado = (
+                    ejecutar_agente(
+                        pregunta,
+                        st.session_state.datos,
+                    )
+                )
+
+            st.session_state.historial.append(
+                {
+                    "usuario": pregunta,
+                    "agente": texto,
+                }
+            )
+
+            st.session_state.resultado = resultado
+
+        except Exception as error:
+            st.error(
+                f"No se pudo ejecutar la búsqueda: "
+                f"{type(error).__name__}: {error}"
+            )
+
+
+if st.session_state.historial:
+
+    st.subheader("Conversación")
+
+    for intercambio in st.session_state.historial:
+
+        with st.chat_message("user"):
+            st.write(
+                intercambio["usuario"]
+            )
+
+        with st.chat_message("assistant"):
+            st.write(
+                intercambio["agente"]
+            )
+
+
+if st.session_state.resultado is not None:
+
+    resultado = st.session_state.resultado
+
+    st.subheader("Candidatos encontrados")
+
+    completos = resultado[
+        resultado["estado"]
+        == "Cumple objetivos"
+    ]
+
+    aproximados = resultado[
+        resultado["estado"]
+        == "Aproximado"
+    ]
+
+    c1, c2 = st.columns(2)
+
+    c1.metric(
+        "Cumplen objetivos",
+        len(completos),
     )
 
-with st.expander(
-    "Procedencia de los datos"
-):
-    st.json(
-        st.session_state.metadata
+    c2.metric(
+        "Candidatos aproximados",
+        len(aproximados),
     )
+
+    st.dataframe(
+        resultado[
+            [
+                "formula",
+                "material_id",
+                "M_vol",
+                "E_hull",
+                "densidad",
+                "ordenamiento",
+                "estado",
+                "motivos",
+            ]
+        ].head(10),
+        hide_index=True,
+        use_container_width=True,
+    )
+
+    st.caption(
+        "La tabla muestra una búsqueda entre materiales "
+        "registrados. No representa una predicción directa "
+        "de SAR o eficacia biomédica."
+    )
+
+    st.subheader(
+        "Visualización de candidatos"
+    )
+
+    graficables = resultado.dropna(
+        subset=["M_vol", "E_hull"]
+    )
+
+    if not graficables.empty:
+
+        figura = px.scatter(
+            graficables,
+            x="E_hull",
+            y="M_vol",
+            color="estado",
+            hover_name="formula",
+            hover_data=[
+                "material_id",
+                "densidad",
+                "ordenamiento",
+            ],
+            labels={
+                "E_hull": "Energía sobre la envolvente (eV/átomo)",
+                "M_vol": "Magnetización (μB/Å³)",
+            },
+        )
+
+        st.plotly_chart(
+            figura,
+            use_container_width=True,
+        )
+
+
+# ============================================================
+# GLOSARIO
+# ============================================================
+
+
+st.divider()
+
+st.subheader(
+    "Conceptos científicos"
+)
+
+for nombre, informacion in DEFINICIONES.items():
+
+    with st.expander(
+        f"{nombre} ({informacion['unidad']})"
+    ):
+
+        st.write(
+            informacion["definicion"]
+        )
+
+        st.markdown(
+            f"**Por qué importa:** "
+            f"{informacion['importancia']}"
+        )
+
+        st.markdown(
+            f"**Limitación:** "
+            f"{informacion['limitacion']}"
+        )
+
+
+# ============================================================
+# SÍNTESIS Y COSTOS
+# ============================================================
+
+
+st.divider()
+
+st.subheader(
+    "Estrategia de síntesis y costo preliminar"
+)
+
+st.write(
+    "Esta sección es educativa. Los precios y cantidades "
+    "deben sustituirse por datos verificados."
+)
+
+st.markdown(
+    "**Material de referencia:** Fe₃O₄"
+)
+
+st.markdown(
+    "**Estrategia:** "
+    f"{RECETA_FE3O4['nombre']}"
+)
+
+st.caption(
+    RECETA_FE3O4["evidencia"]
+)
+
+for paso in RECETA_FE3O4["pasos"]:
+    st.write(f"• {paso}")
+
+tabla_costos, resumen_costos = calcular_costos()
+
+st.dataframe(
+    tabla_costos,
+    hide_index=True,
+    use_container_width=True,
+)
+
+a, b, c = st.columns(3)
+
+a.metric(
+    "Precursores",
+    f"${resumen_costos['Precursores']:.2f} MXN",
+)
+
+b.metric(
+    "Energía",
+    f"${resumen_costos['Energía']:.2f} MXN",
+)
+
+c.metric(
+    "Total preliminar",
+    f"${resumen_costos['Total']:.2f} MXN",
+)
+
+st.warning(
+    "Los precios son ilustrativos y no constituyen una cotización. "
+    "La estrategia no sustituye un protocolo experimental validado."
+)
+
+
+# ============================================================
+# REGISTRO
+# ============================================================
+
+
+with st.expander(
+    "Ver criterios y registro"
+):
+
+    if st.session_state.resultado is not None:
+
+        st.write(
+            "Criterios interpretados por Gemini:"
+        )
+
+        st.json(
+            st.session_state.historial[-1]
+        )
+
+        st.write(
+            "Los datos fueron consultados desde Materials Project "
+            "y procesados con Python."
+        )
