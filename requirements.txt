@@ -1,0 +1,8 @@
+streamlit
+pandas
+numpy
+plotly
+mp-api
+pymatgen
+openai
+pydantic
