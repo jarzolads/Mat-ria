@@ -22,6 +22,13 @@ st.set_page_config(
 )
 
 
+modo = st.sidebar.radio("Modo de trabajo", ["Explorar óxidos", "Búsqueda inversa"])
+if modo == "Búsqueda inversa":
+    from interfaz_inversa import mostrar_inverso
+    mostrar_inverso()
+    st.stop()
+
+
 def secreto(nombre, predeterminado=""):
     """Lee los secretos configurados en Streamlit."""
 
